@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Camera hub</title>
+<style>
+  :root { --bg:#15181c; --panel:#20252b; --text:#e8ecef; --dim:#8d98a3; --accent:#ffb020; --ok:#4cc38a; --bad:#ff6b5e; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:12px; background:var(--bg); color:var(--text); font:16px/1.4 system-ui, sans-serif; max-width:640px; margin-inline:auto; }
+  header { display:flex; justify-content:space-between; align-items:baseline; gap:12px; }
+  h1 { font-size:1.2rem; margin:0; }
+  #status { font-size:.9rem; color:var(--dim); text-align:right; }
+  #status.ok { color:var(--ok); } #status.bad { color:var(--bad); }
+  canvas { width:100%; aspect-ratio:4/3; display:block; background:#000; border-radius:8px; margin:10px 0; touch-action:manipulation; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:8px 0; }
+  label { color:var(--dim); font-size:.9rem; }
+  select, button { font:inherit; color:var(--text); background:var(--panel); border:2px solid transparent; border-radius:8px; padding:8px 12px; }
+  button.sw { border-color:#333a42; min-height:44px; }
+  button.sw.sel { border-color:var(--accent); }
+  button.sw .dot { display:inline-block; width:.9em; height:.9em; border-radius:50%; margin-right:6px; vertical-align:-1px; background:#555; }
+  #conn { width:100%; background:var(--accent); color:#1a1200; font-weight:600; padding:12px; }
+  #conn.on { background:var(--panel); color:var(--text); }
+  #hint { color:var(--dim); font-size:.9rem; margin:6px 0; }
+  input[type=range] { flex:1; min-width:120px; }
+</style>
+</head>
+<body>
+<header><h1>Camera hub</h1><div id="status">starting…</div></header>
+<canvas id="view" width="320" height="240"></canvas>
+<p id="hint">Choose a marker below, then tap that marker in the picture to teach its colour.</p>
+<div class="row" id="swatches"></div>
+<div class="row">
+  <label for="n">Bots</label>
+  <select id="n"><option>1</option><option>2</option><option>3</option><option>4</option></select>
+  <label for="tol">Colour tolerance</label>
+  <input type="range" id="tol" min="5" max="40" value="15">
+</div>
+<button id="conn">Connect to laptop</button>
+
+<script>
+const SERVICE = "12345678-1234-5678-1234-56789abcdef0";   // must match laptop_hub.py
+const CHAR    = "12345678-1234-5678-1234-56789abcdef1";
+const W = 160, H = 120;          // analysis resolution (4:3)
+const SEND_MS = 80;              // ~12 packets per second
+const MIN_BLOB = 4;              // ignore blobs smaller than this many pixels
+const NO_VALUE = 255;
+
+/*PURE*/
+function rgb2hsv(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+  let h = 0;
+  if (d) {
+    if (mx === r) h = ((g - b) / d) % 6; else if (mx === g) h = (b - r) / d + 2; else h = (r - g) / d + 4;
+    h *= 60; if (h < 0) h += 360;
+  }
+  return [h, mx ? d / mx : 0, mx];
+}
+
+// Finds colour blobs. refs[k] = {h,s,v} or null. Returns blobs[k] = [{x,y,n}...] largest first.
+function analyze(px, w, h, refs, tol) {
+  const cls = new Int8Array(w * h).fill(-1);
+  for (let i = 0; i < w * h; i++) {
+    const [ph, s, v] = rgb2hsv(px[i * 4], px[i * 4 + 1], px[i * 4 + 2]);
+    if (s < 0.25 || v < 0.2) continue;
+    let best = -1, bd = tol;
+    for (let k = 0; k < refs.length; k++) {
+      const r = refs[k];
+      if (!r || s < r.s * 0.5 || v < r.v * 0.5) continue;
+      let dh = Math.abs(ph - r.h); dh = Math.min(dh, 360 - dh);
+      if (dh < bd) { bd = dh; best = k; }
+    }
+    cls[i] = best;
+  }
+  const seen = new Uint8Array(w * h), stack = new Int32Array(w * h);
+  const blobs = refs.map(() => []);
+  for (let i = 0; i < w * h; i++) {
+    const c = cls[i];
+    if (c < 0 || seen[i]) continue;
+    let sp = 0, n = 0, sx = 0, sy = 0;
+    stack[sp++] = i; seen[i] = 1;
+    while (sp) {
+      const p = stack[--sp], x = p % w, y = (p / w) | 0;
+      n++; sx += x; sy += y;
+      if (x > 0 && !seen[p - 1] && cls[p - 1] === c) { seen[p - 1] = 1; stack[sp++] = p - 1; }
+      if (x < w - 1 && !seen[p + 1] && cls[p + 1] === c) { seen[p + 1] = 1; stack[sp++] = p + 1; }
+      if (y > 0 && !seen[p - w] && cls[p - w] === c) { seen[p - w] = 1; stack[sp++] = p - w; }
+      if (y < h - 1 && !seen[p + w] && cls[p + w] === c) { seen[p + w] = 1; stack[sp++] = p + w; }
+    }
+    if (n >= MIN_BLOB) blobs[c].push({ x: sx / n + 0.5, y: sy / n + 0.5, n });
+  }
+  blobs.forEach(b => b.sort((a, c) => c.n - a.n));
+  return blobs;
+}
+
+// roles order: [target, rear1..rearN, front]. Packet: [N, target, rears..., fronts...]
+function buildPacket(blobs, n, w, h) {
+  const q = b => b ? [Math.min(254, Math.round(b.x / w * 254)), Math.min(254, Math.round(b.y / h * 254))]
+                   : [NO_VALUE, NO_VALUE];
+  const out = [n, ...q(blobs[0][0])];
+  for (let i = 1; i <= n; i++) out.push(...q(blobs[i][0]));
+  for (let j = 0; j < n; j++) out.push(...q(blobs[n + 1][j]));
+  return Uint8Array.from(out);
+}
+/*END_PURE*/
+
+// ---- UI state ---------------------------------------------------------
+const $ = id => document.getElementById(id);
+const view = $("view"), vctx = view.getContext("2d");
+const small = document.createElement("canvas"); small.width = W; small.height = H;
+const sctx = small.getContext("2d", { willReadFrequently: true });
+const video = document.createElement("video"); video.playsInline = true; video.muted = true;
+let n = 2, tol = 15, sel = 0, cal = {}, lastPx = null, lastBlobs = null;
+try { Object.assign(cal, JSON.parse(localStorage.getItem("cal") || "{}")); n = +localStorage.getItem("n") || n; tol = +localStorage.getItem("tol") || tol; } catch (e) {}
+const roles = () => ["Target", ...Array.from({ length: n }, (_, i) => "Bot " + (i + 1) + " rear"), "Front (all bots)"];
+const keys  = () => ["target", ...Array.from({ length: n }, (_, i) => "rear" + (i + 1)), "front"];
+const save = () => { try { localStorage.setItem("cal", JSON.stringify(cal)); localStorage.setItem("n", n); localStorage.setItem("tol", tol); } catch (e) {} };
+const hsl = c => c ? `hsl(${c.h},${Math.round(c.s * 100)}%,${Math.round(35 + c.v * 20)}%)` : "#555";
+function setStatus(t, cls) { $("status").textContent = t; $("status").className = cls || ""; }
+
+function drawSwatches() {
+  const box = $("swatches"); box.innerHTML = "";
+  roles().forEach((label, i) => {
+    const b = document.createElement("button");
+    b.className = "sw" + (i === sel ? " sel" : "");
+    b.innerHTML = `<span class="dot" style="background:${hsl(cal[keys()[i]])}"></span>`;
+    b.append(label);
+    b.onclick = () => { sel = i; drawSwatches(); };
+    box.append(b);
+  });
+}
+$("n").value = n; $("tol").value = tol;
+$("n").onchange = e => { n = +e.target.value; sel = 0; save(); drawSwatches(); };
+$("tol").oninput = e => { tol = +e.target.value; save(); };
+
+// Tap the picture to learn the colour of the selected marker (average of a 5x5 patch).
+view.addEventListener("click", e => {
+  if (!lastPx) return;
+  const r = view.getBoundingClientRect();
+  const cx = Math.floor((e.clientX - r.left) / r.width * W), cy = Math.floor((e.clientY - r.top) / r.height * H);
+  let R = 0, G = 0, B = 0, c = 0;
+  for (let y = cy - 2; y <= cy + 2; y++) for (let x = cx - 2; x <= cx + 2; x++) {
+    if (x < 0 || y < 0 || x >= W || y >= H) continue;
+    const i = (y * W + x) * 4; R += lastPx[i]; G += lastPx[i + 1]; B += lastPx[i + 2]; c++;
+  }
+  const [h, s, v] = rgb2hsv(R / c, G / c, B / c);
+  if (s < 0.25 || v < 0.2) { setStatus("That spot is too grey or dark — tap a brightly coloured marker", "bad"); return; }
+  cal[keys()[sel]] = { h, s, v }; save();
+  if (sel < roles().length - 1) sel++;
+  drawSwatches();
+});
+
+// ---- Camera -------------------------------------------------------------
+async function startCamera() {
+  if (!isSecureContext) { setStatus("Camera needs HTTPS (or localhost)", "bad"); return; }
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment", width: 640, height: 480 }, audio: false });
+    video.srcObject = s; await video.play();
+    if (navigator.bluetooth) setStatus("camera ready");
+  } catch (e) { setStatus("Camera blocked: " + e.message, "bad"); }
+}
+
+// ---- Bluetooth ------------------------------------------------------------
+let dev = null, chr = null, writing = false, want = false, wake = null;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function openGatt() {
+  const server = await dev.gatt.connect();
+  chr = await (await server.getPrimaryService(SERVICE)).getCharacteristic(CHAR);
+  setStatus("connected to laptop", "ok");
+}
+async function onDrop() {
+  chr = null;
+  while (want) {                                   // keep retrying until the user disconnects
+    setStatus("laptop link lost — reconnecting…", "bad");
+    try { await openGatt(); return; } catch (e) { await sleep(1500); }
+  }
+}
+$("conn").onclick = async () => {
+  if (want) {                                      // acts as a Disconnect button
+    want = false; if (dev && dev.gatt.connected) dev.gatt.disconnect();
+    if (wake) { wake.release().catch(() => {}); wake = null; }
+    $("conn").textContent = "Connect to laptop"; $("conn").className = ""; setStatus("disconnected"); return;
+  }
+  if (!navigator.bluetooth) { setStatus("No Web Bluetooth: use Chrome on Android (or Bluefy on iPhone)", "bad"); return; }
+  try {
+    if (!dev) {
+      dev = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE] }] });
+      dev.addEventListener("gattserverdisconnected", onDrop);
+    }
+    want = true; setStatus("connecting…");
+    await openGatt();
+    $("conn").textContent = "Disconnect"; $("conn").className = "on";
+    try { wake = await navigator.wakeLock.request("screen"); } catch (e) {}
+  } catch (e) { want = false; setStatus("Connect failed: " + e.message, "bad"); }
+};
+
+// ---- Main loop: grab frame, find markers, draw, send -------------------------
+function tick() {
+  if (video.readyState < 2) return;
+  const vw = video.videoWidth, vh = video.videoHeight;
+  let sw = vw, sh = vh;                            // centre-crop the video to 4:3
+  if (vw / vh > 4 / 3) sw = vh * 4 / 3; else sh = vw * 3 / 4;
+  const sx = (vw - sw) / 2, sy = (vh - sh) / 2;
+  sctx.drawImage(video, sx, sy, sw, sh, 0, 0, W, H);
+  vctx.drawImage(video, sx, sy, sw, sh, 0, 0, view.width, view.height);
+  lastPx = sctx.getImageData(0, 0, W, H).data;
+
+  const k = keys(), refs = k.map(key => cal[key] || null);
+  const blobs = analyze(lastPx, W, H, refs, tol);
+  lastBlobs = blobs;
+  const sx2 = view.width / W, sy2 = view.height / H;
+  vctx.lineWidth = 2; vctx.font = "bold 14px system-ui"; vctx.textBaseline = "middle";
+  blobs.forEach((list, i) => {
+    const front = i === k.length - 1, tag = i === 0 ? "T" : front ? "F" : String(i);
+    list.slice(0, front ? n : 1).forEach(b => {
+      vctx.strokeStyle = "#fff"; vctx.fillStyle = "#fff";
+      vctx.beginPath(); vctx.arc(b.x * sx2, b.y * sy2, 9, 0, 7); vctx.stroke();
+      vctx.fillText(tag, b.x * sx2 + 12, b.y * sy2);
+    });
+  });
+
+  if (chr && !writing) {
+    writing = true;
+    const pkt = buildPacket(blobs, n, W, H);
+    const w = chr.writeValueWithoutResponse ? chr.writeValueWithoutResponse(pkt) : chr.writeValue(pkt);
+    w.catch(() => {}).finally(() => { writing = false; });
+  }
+}
+
+drawSwatches();
+if (!navigator.bluetooth) setStatus("No Web Bluetooth: use Chrome on Android", "bad");
+startCamera();
+setInterval(tick, SEND_MS);
+</script>
+</body>
+</html>
